@@ -76,7 +76,7 @@ if [ -z "$NEXT" ]; then
   echo "Could not pour next refinery wisp; not burning."
   exit 1
 fi
-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+if ! gc bd update "$NEXT" --assignee="$GC_AGENT" --status=in_progress; then
   echo "Could not assign next refinery wisp; not burning."
   exit 1
 fi
@@ -121,7 +121,7 @@ if [ -z "$NEXT" ]; then
   echo "Could not pour next refinery wisp; not requesting restart."
   exit 1
 fi
-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+if ! gc bd update "$NEXT" --assignee="$GC_AGENT" --status=in_progress; then
   echo "Could not assign next refinery wisp; not requesting restart."
   exit 1
 fi
