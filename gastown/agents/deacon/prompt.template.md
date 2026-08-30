@@ -98,7 +98,7 @@ if [ -n "$CURRENT_WISP" ] && [ -z "$ASSIGNED_WISP" ]; then
     echo "Could not pour next deacon wisp; not burning."
     exit 1
   fi
-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+  if ! gc bd update "$NEXT" --assignee="$GC_AGENT" --status=in_progress; then
     echo "Could not assign next deacon wisp; not burning."
     exit 1
   fi
@@ -111,7 +111,7 @@ elif [ -z "$ASSIGNED_WISP" ]; then
     echo "Could not bootstrap next deacon wisp."
     exit 1
   fi
-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+  if ! gc bd update "$NEXT" --assignee="$GC_AGENT" --status=in_progress; then
     echo "Could not assign bootstrap deacon wisp."
     exit 1
   fi
