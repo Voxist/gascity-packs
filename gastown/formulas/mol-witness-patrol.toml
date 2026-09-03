@@ -2,7 +2,7 @@ description = """
 Witness patrol loop. Poured as a root-only wisp on startup:
 
   gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{binding_prefix}}'
-  gc bd update $WISP --assignee=$GC_AGENT
+  gc bd update $WISP --assignee=$GC_AGENT --status=in_progress
 
 Each wisp is ONE iteration: check for work, patrol, pour the next
 iteration. On crash, re-read the formula steps and determine where
