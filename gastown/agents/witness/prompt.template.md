@@ -112,8 +112,10 @@ Routine recoveries from pool resizing or config changes don't need mayor mail.
 **Do NOT recover beads for sessions that are still controller- or
 operator-owned.** Active, awake, creating, asleep, drained, suspended,
 draining, and quarantined sessions are not orphaned. Only recover pool work
-whose resolved owner is archived, closed, or absent after exact identity
-lookup.
+whose resolved owner is `dead` — in the roster, archived or closed (ADR-0144
+P3). An assignee that matches **no** identity in the liveness map is
+`unresolvable`, not dead — report it, never reset it; the formula's
+`recover-orphaned-beads` step is the source of truth for this distinction.
 
 ---
 
