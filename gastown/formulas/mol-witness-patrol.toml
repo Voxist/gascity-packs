@@ -169,23 +169,38 @@ matching against a template pattern (e.g., `worker-3` matches template
 witness skips it thinking "the pool will restart it." The pool creates
 a NEW session with a different ID — the old one never comes back.
 
-**Liveness check procedure:**
+**Liveness check procedure (ADR-0144 / vp-ccdw0):**
+
+**Invariant — an assignee and a session identity are drawn from different
+namespaces.** 13/16 live assignee shapes are rig-qualified (`<rig>/<agent_name>`,
+the form `gc agent list`, `gc.routed_to`, and `gc sling` all mandate); a
+liveness join between them MUST be closed on the SESSION side, by enriching
+each session with every address form under which it can legitimately be
+assigned, computed from configuration. It MUST NOT be closed by parsing,
+stripping, or pattern-matching the assignee — do NOT extract a session ID
+with a regex or fixed prefix list: rig prefixes are configuration-derived,
+and assignees may be a session bead ID, session name, alias, concrete agent
+name, rig-qualified agent address, or configured named identity.
 
 1. Build the assignee→state liveness map ONCE per cycle (before the
-   per-bead loop), then resolve each bead's assignee against it. Resolve by
-   exact identifier lookup — do NOT extract a session ID with a regex or
-   fixed prefix list: rig prefixes are configuration-derived, and assignees
-   may be a session bead ID, session name, alias, concrete agent name, or
-   configured named identity.
+   per-bead loop), then resolve each bead's assignee against it.
 
    Two schema facts this recipe depends on (verified live, gc-3tn8g):
    - `gc session list --json` returns an OBJECT `{sessions:[...], ...}`, not
      a top-level array — iterate `.sessions[]`, never the top level (the
      top-level values include booleans, so `$x.id` on them errors).
    - Session fields are lowercase snake_case: `id / name / session_name /
-     alias / agent_name / state / closed`. Key the map on `id`, `name`,
+     alias / agent_name / rig / state / closed`. Key the map on `id`, `name`,
      `session_name`, `alias`, and `agent_name` — the exact identifier forms
-     an assignee may take.
+     an assignee may take — **plus** the session's rig-qualified address
+     (ADR-0144 P2). The rig is published on the session object (`.rig`) —
+     exactly what `gc agent list` prints — never parsed from the assignee
+     (C1). `.agent_name` on some gc builds is already rig-qualified for
+     rig-scoped agents (observed live 2026-10-02); on others it is bare.
+     Compute the qualified key defensively so the recipe is correct either
+     way: skip if `.agent_name` is already qualified (don't double-prefix)
+     or if `.rig` is absent (city-singleton agents — `gastown.mayor`,
+     `voxist.librarian` — are not rig-scoped and need no qualified form).
 
    Stream both JSON blobs through temp files, never `--argjson` on argv: on a
    busy city the session `command` fields are large and overflow ARG_MAX
@@ -200,12 +215,19 @@ a NEW session with a different ID — the old one never comes back.
        if (($key // "") | length) == 0 then $m
        else $m + {($key): (if $closed then "closed" else ($state // "") end)}
        end;
+     def rig_qualified($rig; $agent_name):
+       if (($agent_name // "") | length) == 0 then null
+       elif ($agent_name | test("/")) then null
+       elif (($rig // "") | length) == 0 then null
+       else ($rig + "/" + $agent_name)
+       end;
      (reduce ($sessions[0].sessions // [])[] as $s ({};
          add(.; $s.id;         $s.state; ($s.closed // false))
        | add(.; $s.name;       $s.state; ($s.closed // false))
        | add(.; $s.session_name; $s.state; ($s.closed // false))
        | add(.; $s.alias;      $s.state; ($s.closed // false))
        | add(.; $s.agent_name; $s.state; ($s.closed // false))
+       | add(.; rig_qualified($s.rig; $s.agent_name); $s.state; ($s.closed // false))
      )) as $from_sessions
      | reduce ($session_beads[0] // [])[] as $b ($from_sessions;
          add(.; $b.metadata.configured_named_identity; $b.metadata.state; ($b.status == "closed")))')
@@ -214,12 +236,26 @@ a NEW session with a different ID — the old one never comes back.
    MAP_COUNT=$(printf '%s' "$LIVENESS_MAP" | jq -r 'length')
    rm -f "$SESSIONS_FILE" "$SESSION_BEADS_FILE"
    ```
+   *(AC1 check: `printf '%s' "$LIVENESS_MAP" | jq -r 'keys[] | select(test("/"))' | wc -l` must be
+   `> 0` on any roster with ≥1 rig-scoped session.)*
 
-   **Fail safe — never orphan on an empty map.** If the map is empty while
+2. Resolve each bead's assignee against the prebuilt map. A miss is
+   **`unresolvable`**, not `absent` — per ADR-0091 an unobserved identity is
+   not a dead one, and per ADR-0144 P3 `unresolvable` carries a different
+   verdict than a genuinely dead session (see Classify, below):
+   ```bash
+   STATE=$(printf '%s' "$LIVENESS_MAP" | jq -r --arg a "$ASSIGNEE" '.[$a] // "unresolvable"')
+   ```
+   Tally this across every assigned pool/ephemeral bead in the cycle
+   (`UNRESOLVED_COUNT` / `TOTAL_COUNT`) — the rate fail-safe below needs the
+   cycle total, not a per-bead view.
+
+   **Fail safe 1 — never orphan on an empty map.** If the map is empty while
    sessions exist, the schema has drifted again (the exact failure in
-   gc-3tn8g). An empty map resolves every assignee to `absent` and would
-   false-orphan live agents. ABORT recovery this cycle — do NOT classify any
-   bead as orphaned — escalate, then continue to `check-refinery`:
+   gc-3tn8g). An empty map resolves every assignee to `unresolvable` and
+   would — absent fail-safe 2 below — eventually look identical to total
+   join failure. ABORT recovery this cycle — do NOT classify any bead as
+   orphaned — escalate, then continue to `check-refinery`:
    ```bash
    if [ "${MAP_COUNT:-0}" -eq 0 ] && [ "${SESSION_COUNT:-0}" -gt 0 ]; then
      echo "FAIL-SAFE: empty liveness map with $SESSION_COUNT live sessions — skipping orphan recovery (treat all assignees as live)."
@@ -228,29 +264,54 @@ a NEW session with a different ID — the old one never comes back.
    fi
    ```
 
-   Resolve each bead's assignee against the prebuilt map:
+   **Fail safe 2 — never orphan at an implausible unresolved rate (ADR-0144
+   P4).** A non-empty map that still can't resolve most assignees is the
+   SAME join failure as an empty one — just not caught by fail-safe 1 (this
+   is exactly how the F3/F4 defect in ADR-0144 went undetected: 30 keys
+   present, 13/16 distinct assignee shapes still unresolvable). If more than
+   half of this cycle's assigned pool/ephemeral beads resolve
+   `unresolvable`, treat it as a join failure: skip recovery for every bead
+   this cycle (report-only — do not reset or close anything), and escalate
+   once:
    ```bash
-   STATE=$(printf '%s' "$LIVENESS_MAP" | jq -r --arg a "$ASSIGNEE" '.[$a] // "absent"')
+   if [ "${TOTAL_COUNT:-0}" -gt 0 ]; then
+     RATE_PPT=$(( UNRESOLVED_COUNT * 1000 / TOTAL_COUNT ))  # parts-per-thousand, integer-safe
+     if [ "$RATE_PPT" -gt 500 ]; then
+       echo "FAIL-SAFE: $UNRESOLVED_COUNT/$TOTAL_COUNT assigned beads unresolvable this cycle — skipping orphan recovery (report-only)."
+       gc mail send mayor/ -s "WITNESS: orphan-recovery disabled — implausible unresolved rate" -m "$UNRESOLVED_COUNT of $TOTAL_COUNT assigned pool/ephemeral beads resolved unresolvable this cycle (>50%). This is namespace drift, not mass agent death (ADR-0144 F3/F4) — skipping recovery to avoid false-orphaning live rig-qualified seats. Re-measure the assignee corpus against the liveness map."
+       # Skip Step 2 (salvage) / Step 3 (reset) for every bead; proceed to check-refinery.
+     fi
+   fi
    ```
 
-2. An `absent` lookup (assignee not in the map) is orphaned only for
-   pool/ephemeral work identities. If the assignee is a refinery, witness, or
-   other configured infrastructure identity, skip it instead of recovering it.
+3. Infra carve-out: beads assigned to the refinery, witness, or other
+   configured infrastructure identities (not pool instances) are skipped
+   entirely — regardless of resolved state — because those agents have
+   persistent identity and the controller manages their lifecycle directly.
+   This carve-out is orthogonal to Classify below; infra identities never
+   reach recovery, even when their resolved state would otherwise be `dead`.
 
-3. Classify:
+4. Classify (three-valued, ADR-0091 / ADR-0144 P3):
    - `active` or `awake` → **not orphaned** (may be stuck —
      `check-polecat-health` handles that separately)
    - `creating`, `asleep`, `drained`, `suspended`, `draining`, or
      `quarantined` → **not orphaned** (controller or operator state still owns
      the session)
-   - `archived`, `closed`, or `absent` after the exact lookup → **orphaned
-     bead** for pool/ephemeral work — the owning session is gone and will never
-     come back, regardless of whether the pool template still exists
-
-**Important**: Beads assigned to the refinery, witness, or other
-infrastructure agents (not pool instances) should be skipped — those
-agents have persistent identity and the controller manages their
-lifecycle directly.
+   - `archived` or `closed` → **`dead`** → **orphaned bead** for
+     pool/ephemeral work — the owning session is IN THE ROSTER in a terminal
+     state; it is gone and will never come back
+   - `unresolvable` (matched nothing in the map) → **NOT orphaned.** Report
+     it (Step 4, below) — do not reset or close it. An assignee that matches
+     no identity may be live-but-unmodeled (a namespace gap, exactly what
+     ADR-0144 found), a human (`karel@voxist.com`-shaped), or genuinely dead
+     with no trace left in the roster — the lookup cannot tell these apart,
+     and a reset is irreversible while a report is not. **Only `dead`
+     authorizes recovery** — this split is the load-bearing change: it means
+     a future namespace drift (P2 going stale again) degrades into noise
+     (more `unresolvable` reports) instead of silently regressing to data
+     loss (false resets), because P2 is now an optimization on top of this
+     guard, not the only thing standing between the fleet and a destructive
+     reset.
 
 **Step 2: For each orphaned bead, salvage work from the worktree.**
 
@@ -370,6 +431,7 @@ recovery is unexpected or concerning — use your judgment:
 | Agent crashed mid-work, branch already on origin | Log + nudge mayor. Low urgency. |
 | Work salvaged from worktree (data was at risk) | Log + mail mayor. Work was nearly lost. |
 | Same bead recovered before (check `metadata.recovered`) | Log + mail mayor. Possible crash loop. |
+| Bead resolved `unresolvable` (ADR-0144 P3) | Log only — do NOT reset/close. Batch all of this cycle's unresolvable assignees into ONE report (bead ids + assignee strings), not one mail per bead. |
 
 When you do mail:
 ```bash
